@@ -22,15 +22,14 @@ echo "  ✓ Postgres ready"
 
 # ── 2. Migrations ────────────────────────────────────────────────────────────
 echo ""
-echo "▶ Running database migrations…"
-(cd "$API_DIR" && source .venv/bin/activate 2>/dev/null || true && alembic upgrade head)
-echo "  ✓ Migrations applied"
+echo "▶ Running migrations…"
+(cd "$API_DIR" && source .venv/bin/activate 2>/dev/null || true && PYTHONPATH="$API_DIR/src" alembic upgrade head)
 
 # ── 3. API (background) ──────────────────────────────────────────────────────
 echo ""
 echo "▶ Starting API (http://localhost:8000)…"
 (cd "$API_DIR" && source .venv/bin/activate 2>/dev/null || true && \
-  uvicorn canary_api.main:app --reload --host 0.0.0.0 --port 8000) &
+  PYTHONPATH="$API_DIR/src" uvicorn canary_api.main:app --reload --host 0.0.0.0 --port 8000) &
 API_PID=$!
 
 # ── 4. Web ────────────────────────────────────────────────────────────────────

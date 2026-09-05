@@ -14,7 +14,7 @@ echo "🐦 Running backend tests (pytest)…"
 cd "$API_DIR"
 source .venv/bin/activate 2>/dev/null || true
 
-if pytest --tb=short -q "${@}"; then
+if PYTHONPATH="$API_DIR/src" pytest --tb=short -q "${@}"; then
   echo "✓ Backend tests passed"
 else
   echo "✗ Backend tests FAILED"
