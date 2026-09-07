@@ -1,24 +1,47 @@
 """
 Shared pytest fixtures for all test levels.
 
-Uses SQLite + aiosqlite so no live PostgreSQL is required.
-The pgvector VECTOR column type is not available in SQLite, so we swap it
-out for a plain nullable Text column before the tables are created.
+Architecture:
+  - Unit tests  (tests/unit/)          — pure Python, no DB
+  - Integration tests (tests/integration/) — real PostgreSQL via Docker
+
+Integration tests require postgres on localhost:5433:
+    docker compose up postgres -d
+
+Each integration test gets its own fresh asyncpg connection (NullPool)
+to avoid event-loop and "operation in progress" issues with asyncpg.
+The test database (canary_test) is created once per session and dropped
+on teardown.
+
+Settings are overridden via a pytest fixture that clears the lru_cache
+and injects test values, covering every call site.
 """
 
 from __future__ import annotations
+
+import os
+import subprocess
+import sys
 
 import pytest
 import pytest_asyncio
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from canary_api.core.config import Settings
 
+# ---------------------------------------------------------------------------
+# Test database URL
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TEST_DB = "postgresql+asyncpg://canary:canary@localhost:5433/canary_test"
+TEST_DB_URL = os.environ.get("CANARY_TEST_DATABASE_URL", _DEFAULT_TEST_DB)
+
 
 # ---------------------------------------------------------------------------
-# Test settings — SQLite in-memory, overrides all infra URLs
+# Test settings fixture (session-scoped — same object reused)
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
@@ -26,8 +49,8 @@ def test_settings() -> Settings:
     return Settings(
         environment="test",
         debug=True,
-        database_url="sqlite+aiosqlite:///:memory:",
-        database_sync_url="sqlite:///:memory:",
+        database_url=TEST_DB_URL,
+        database_sync_url=TEST_DB_URL.replace("+asyncpg", "+psycopg"),
         database_echo=False,
         redis_url="redis://localhost:6379/15",
         celery_broker_url="redis://localhost:6379/15",
@@ -39,39 +62,66 @@ def test_settings() -> Settings:
 
 
 # ---------------------------------------------------------------------------
-# Engine: patch pgvector VECTOR → Text before table creation
+# Create canary_test database once; migrate; drop on teardown
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture(scope="session")
-async def engine(test_settings: Settings):
-    """Session-scoped in-memory SQLite engine with all tables."""
+async def _test_database(test_settings: Settings):
+    """Create canary_test, run migrations, yield, drop."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine as _cae
 
-    # Import models so Base.metadata is populated
-    import canary_api.persistence.models  # noqa: F401
+    admin_url = TEST_DB_URL.rsplit("/", 1)[0] + "/canary"
+    admin_eng = _cae(admin_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    async with admin_eng.connect() as conn:
+        await conn.execute(text("DROP DATABASE IF EXISTS canary_test"))
+        await conn.execute(text("CREATE DATABASE canary_test"))
+    await admin_eng.dispose()
 
-    # Patch pgvector VECTOR column so SQLite can create the table
-    from sqlalchemy import Text
-    from sqlalchemy.orm import mapped_column
-    from canary_api.persistence.models.code import CodeEntity
-    CodeEntity.embedding = mapped_column("embedding", Text, nullable=True)
+    # Run Alembic in a subprocess so it uses its own event loop
+    api_dir = os.path.dirname(os.path.dirname(__file__))  # apps/api/
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=api_dir,
+        env={**os.environ, "CANARY_DATABASE_URL": TEST_DB_URL,
+             "PYTHONPATH": os.path.join(api_dir, "src")},
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Alembic migration failed:\nSTDERR: {result.stderr}\nSTDOUT: {result.stdout}")
 
-    from canary_api.persistence.base import Base
+    yield  # tests run here
 
-    eng = create_async_engine(test_settings.database_url, echo=False)
-    async with eng.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    # Teardown
+    admin_eng2 = _cae(admin_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
+    async with admin_eng2.connect() as conn:
+        await conn.execute(text(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = 'canary_test' AND pid <> pg_backend_pid()"
+        ))
+        await conn.execute(text("DROP DATABASE IF EXISTS canary_test"))
+    await admin_eng2.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Per-test async engine using NullPool — avoids asyncpg event-loop issues
+# ---------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def engine(_test_database):
+    """Fresh NullPool engine per test — no connection reuse across event loops."""
+    eng = create_async_engine(TEST_DB_URL, poolclass=NullPool, echo=False)
     yield eng
     await eng.dispose()
 
 
 # ---------------------------------------------------------------------------
-# Per-test DB session — rolled back after each test for isolation
+# Per-test DB session
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
 async def db_session(engine):
-    """Yields a transactional session rolled back after each test."""
-
     factory = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
     async with factory() as session:
         yield session
@@ -79,34 +129,35 @@ async def db_session(engine):
 
 
 # ---------------------------------------------------------------------------
-# FastAPI ASGI test client — wired to the same in-memory DB
+# FastAPI ASGI test client — fresh engine + overridden settings per test
 # ---------------------------------------------------------------------------
 
 @pytest_asyncio.fixture
 async def client(test_settings: Settings, engine):
-    """Async HTTP client with the test DB wired in via app.state."""
-
-    from canary_api.core.config import get_settings
+    """
+    Async HTTP client with:
+      - test_settings injected at every call site
+      - fresh NullPool engine wired into app.state
+    """
+    from unittest.mock import patch
+    from canary_api.core import config as cfg_module
+    from canary_api.api.deps import config as dep_cfg_module
     from canary_api.main import create_app
 
-    # Override the cached settings singleton for this test run
-    get_settings.cache_clear()
+    # Clear lru_cache so our patched version is used
+    cfg_module.get_settings.cache_clear()
 
     app = create_app()
-
-    # Manually set app.state so lifespan doesn't create a second engine
     factory = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
     app.state.engine = engine
     app.state.session_factory = factory
 
-    # Patch get_settings so the app uses test config (no real DB URL)
-    import unittest.mock as mock
-    with mock.patch("canary_api.core.config.get_settings", return_value=test_settings), \
-         mock.patch("canary_api.api.deps.config.get_settings", return_value=test_settings):
+    with patch.object(cfg_module, "get_settings", return_value=test_settings), \
+         patch.object(dep_cfg_module, "get_settings", return_value=test_settings):
         async with AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://test",
         ) as ac:
             yield ac
 
-    get_settings.cache_clear()
+    cfg_module.get_settings.cache_clear()
