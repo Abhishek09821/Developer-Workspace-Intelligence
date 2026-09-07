@@ -2,7 +2,6 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2023"],
-    "types": ["vitest/globals"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",
